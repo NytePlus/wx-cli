@@ -3,17 +3,30 @@ use std::process::Command;
 
 use crate::error::KeychainError;
 
-pub const SUPPORTED_VERSION: &str = "4.1.8.21";
+pub const SUPPORTED_VERSION: &str = "4.1.7+";
 
-/// Version prefixes accepted for LLDB key extraction.
-/// Encryption params (PBKDF2-HMAC-SHA512, 256K iterations) are identical across these versions.
-const EXTRACTION_VERSION_PREFIXES: &[&str] = &["4.1.7", "4.1.8"];
+/// Minimum version accepted for key extraction.
+/// Encryption params (PBKDF2-HMAC-SHA512, 256K iterations) are identical from this version onward.
+const MIN_EXTRACTION_VERSION: (u64, u64, u64) = (4, 1, 7);
 
 /// Check whether a version string is compatible with our LLDB key extraction.
 fn is_extraction_compatible(version: &str) -> bool {
-    EXTRACTION_VERSION_PREFIXES
-        .iter()
-        .any(|prefix| version == *prefix || version.starts_with(&format!("{prefix}.")))
+    let mut components = version.split('.');
+    let Some(major) = components.next().and_then(|value| value.parse().ok()) else {
+        return false;
+    };
+    let Some(minor) = components.next().and_then(|value| value.parse().ok()) else {
+        return false;
+    };
+    let Some(patch) = components.next().and_then(|value| value.parse().ok()) else {
+        return false;
+    };
+
+    if components.any(|value| value.is_empty() || value.parse::<u64>().is_err()) {
+        return false;
+    }
+
+    (major, minor, patch) >= MIN_EXTRACTION_VERSION
 }
 
 #[derive(Debug, Clone)]
@@ -353,6 +366,28 @@ fn tiebreak_by_wal_mtime<'a>(accounts: &[&'a AccountDirInfo]) -> Option<&'a Acco
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_extraction_version_accepts_4_1_7_and_newer() {
+        for version in [
+            "4.1.7", "4.1.7.31", "4.1.8", "4.1.9", "4.1.13", "4.2.0", "5.0.0",
+        ] {
+            assert!(
+                is_extraction_compatible(version),
+                "expected {version} to be supported"
+            );
+        }
+    }
+
+    #[test]
+    fn test_extraction_version_rejects_older_and_invalid_versions() {
+        for version in ["4.1.6.99", "4.0.99", "3.9.9", "4.1", "4.1.beta", ""] {
+            assert!(
+                !is_extraction_compatible(version),
+                "expected {version:?} to be rejected"
+            );
+        }
+    }
 
     #[test]
     fn test_extract_base_wxid_with_suffix() {

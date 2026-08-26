@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- Accept WeChat 4.1.7 and newer for key extraction instead of maintaining a fixed version-prefix allowlist.
+
 ## [0.7.4] - 2026-07-22
 
 ### Features

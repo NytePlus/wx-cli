@@ -20,7 +20,9 @@ pub enum KeychainError {
     #[error("WeChat is not running")]
     WeChatNotRunning,
 
-    #[error("WeChat version {version} is not supported for key extraction (requires 4.1.7.x or 4.1.8.x)")]
+    #[error(
+        "WeChat version {version} is not supported for key extraction (requires 4.1.7 or newer)"
+    )]
     UnsupportedVersion { version: String },
 
     #[error("could not detect WeChat account directory")]

@@ -38,7 +38,7 @@ wx-cli 提供了最关键的两样东西：完整的历史上下文，以及持�
 ## 支持范围
 
 - **平台**：macOS（arm64 / Apple Silicon）
-- **WeChat 版本**：4.1.7.x / 4.1.8.x
+- **WeChat 版本**：4.1.7 及以上
 
 ## 前置条件
 
@@ -265,4 +265,4 @@ wx-cli/
 
 - `wx-cli key list` 确认密钥正确
 - `wx-cli info <db>` 检查文件是否为加密状态
-- 确认 WeChat 版本在 4.1.7.x / 4.1.8.x 范围内
+- 确认 WeChat 版本不低于 4.1.7
