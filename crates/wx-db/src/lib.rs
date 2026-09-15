@@ -31,6 +31,7 @@ mod decode;
 mod error;
 mod fts;
 mod messages;
+pub mod incremental;
 mod model;
 pub mod native_fts;
 mod open;

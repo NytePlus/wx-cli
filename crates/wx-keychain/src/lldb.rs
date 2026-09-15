@@ -64,14 +64,10 @@ pub async fn capture_key(
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Write capture script to temp file.
-    let script_path = wx_paths::AppPaths::lldb_script_file();
-    if let Some(parent) = script_path.parent() {
-        wx_paths::AppPaths::ensure_dir(parent)?;
-    }
+    let script_dir = tempfile::tempdir()?;
+    let script_path = script_dir.path().join("capture.py");
     std::fs::write(&script_path, CAPTURE_KEY_SCRIPT)?;
 
-    // Prepare LLDB output file.
-    let output_path = wx_paths::AppPaths::lldb_output_file();
 
     // Launch LLDB in wait mode.
     let mut lldb = AsyncCommand::new("lldb")
@@ -80,12 +76,13 @@ pub async fn capture_key(
             "-n",
             "WeChat",
             "-o",
-            &format!("command script import {}", script_path.display()),
+            &format!("command script import '{}'", script_path.display()),
             "-o",
             "capture_keys",
         ])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
         .map_err(|e| KeychainError::Other(format!("failed to start lldb: {e}")))?;
 
@@ -110,7 +107,6 @@ pub async fn capture_key(
     let mut current_call: Option<(u32, u32)> = None; // (call_count, rounds)
     let mut current_password: Option<String> = None;
     let mut call_count = 0u32;
-    let mut output_lines = Vec::new();
 
     let result = timeout(capture_timeout, async {
         loop {
@@ -120,7 +116,6 @@ pub async fn capture_key(
                 Err(e) => break Err(KeychainError::Other(format!("read error: {e}"))),
             };
 
-            output_lines.push(line.clone());
 
             if let Some(caps) = re_header.captures(&line) {
                 let count: u32 = caps[1].parse().unwrap_or(0);
@@ -198,8 +193,7 @@ pub async fn capture_key(
     })
     .await;
 
-    // Save output for debugging.
-    let _ = std::fs::write(&output_path, output_lines.join("\n"));
+    // LLDB output contains database keys. Never persist or forward it.
 
     // Kill LLDB.
     let _ = lldb.kill().await;

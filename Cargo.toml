@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/wx-decrypt", "crates/wx-keychain", "crates/wx-cli", "crates/wx-db", "crates/wx-media", "crates/wx-monitor", "crates/wx-context", "crates/wx-paths"]
+members = ["crates/wx-decrypt", "crates/wx-keychain", "crates/wx-cli", "crates/wx-db", "crates/wx-media", "crates/wx-monitor", "crates/wx-context", "crates/wx-paths", "crates/imcp-wechat"]
 resolver = "2"
 
 [workspace.package]

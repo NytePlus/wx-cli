@@ -1197,6 +1197,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "imcp-wechat"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "getrandom 0.2.17",
+ "hex",
+ "hmac",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "wx-db",
+ "wx-keychain",
+ "wx-media",
+]
+
+[[package]]
 name = "indexmap"
 version = "2.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
