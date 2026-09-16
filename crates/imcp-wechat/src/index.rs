@@ -158,9 +158,27 @@ impl Index {
             _ => bail!("ambiguous_conversation: {}", serde_json::to_string(&ids)?),
         }
     }
+    /// Freshness is scoped to a conversation, including empty/not-yet-synced results.
+    pub fn with_sync_metadata(&self, conversation: &str, mut value: Value) -> Result<Value> {
+        let synced: Option<String> = self
+            .db
+            .query_row(
+                "SELECT value FROM settings WHERE key=?1",
+                [format!("synced:{conversation}")],
+                |r| r.get(0),
+            )
+            .optional()?;
+        value["last_synced_at"] = json!(synced);
+        value["sync_mode"] = json!("manual");
+        Ok(value)
+    }
     pub fn list(&self, q: &str, local: bool) -> Result<Value> {
         let mut stmt=self.db.prepare("SELECT id,name,state,enabled FROM conversations WHERE (enabled=1 OR ?2) AND (instr(name,?1)>0 OR instr(id,?1)>0) ORDER BY name,id LIMIT 200")?;
         let items=stmt.query_map(params![q,local],|r|Ok(json!({"conversation_id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"index_state":r.get::<_,String>(2)?,"enabled":r.get::<_,bool>(3)?})))?.collect::<Result<Vec<_>,_>>()?;
+        let items = items
+            .into_iter()
+            .map(|item| self.with_sync_metadata(&text(&item, "conversation_id"), item))
+            .collect::<Result<Vec<_>>>()?;
         Ok(json!({"items":items}))
     }
     pub fn insert(&self, source: &SourceMessage) -> Result<bool> {

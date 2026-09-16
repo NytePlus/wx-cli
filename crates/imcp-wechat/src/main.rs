@@ -218,7 +218,10 @@ impl Backend {
                 )?;
                 Ok(json!({"ok":true}))
             }
-            "get_messages" | "search_messages" => idx.query(p, false),
+            "get_messages" | "search_messages" => {
+                let conv = idx.resolve(&text(p, "conversation"))?;
+                idx.with_sync_metadata(&conv, idx.query(p, false)?)
+            }
             "sync" => self.manual_sync(p),
             "get_updates" => {
                 if p["wait_seconds"].as_i64().unwrap_or(0) != 0 {
@@ -226,21 +229,15 @@ impl Backend {
                 }
                 let mut value = idx.query(p, true)?;
                 let conv = idx.resolve(&text(p, "conversation"))?;
-                let synced: Option<String> = idx
-                    .db
-                    .query_row(
-                        "SELECT value FROM settings WHERE key=?1",
-                        [format!("synced:{conv}")],
-                        |r| r.get(0),
-                    )
-                    .optional()?;
-                value["sync_mode"] = json!("manual");
-                value["last_synced_at"] = json!(synced);
+                value = idx.with_sync_metadata(&conv, value)?;
                 value["source_checked"] = json!(false);
                 value["sync_required"] = json!(true);
                 Ok(value)
             }
-            "list_members" => idx.members(p),
+            "list_members" => {
+                let conv = idx.resolve(&text(p, "conversation"))?;
+                idx.with_sync_metadata(&conv, idx.members(p)?)
+            }
             "get_message_context" => {
                 let id = text(p, "message_id");
                 let row:Option<(String,i64)>=idx.db.query_row("SELECT m.conversation,m.time FROM messages m JOIN conversations c ON c.id=m.conversation AND c.enabled=1 WHERE m.id=?1",[&id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
@@ -257,21 +254,25 @@ impl Backend {
                         text(m, "message_id"),
                     )
                 });
-                Ok(json!({"items":items}))
+                idx.with_sync_metadata(&conv, json!({"items":items}))
             }
             "authorize_message" | "get_media" => {
                 let row:Option<String>=idx.db.query_row("SELECT m.data FROM messages m JOIN conversations c ON c.id=m.conversation AND c.enabled=1 WHERE m.id=?1",[text(p,"message_id")],|r|r.get(0)).optional()?;
                 let data: Value = serde_json::from_str(&row.context("message_unavailable")?)?;
                 if method == "authorize_message" {
-                    Ok(json!({"authorized":true}))
+                    idx.with_sync_metadata(
+                        &text(&data, "conversation_id"),
+                        json!({"authorized":true}),
+                    )
                 } else {
-                    media::extract(
+                    let result = media::extract(
                         self.source.as_ref().context("source_unavailable")?,
                         &self.root,
                         &self.archive_path.with_extension("media"),
                         &data,
                         self.image_key,
-                    )
+                    )?;
+                    idx.with_sync_metadata(&text(&data, "conversation_id"), result)
                 }
             }
             _ => bail!("unknown_method"),
@@ -324,7 +325,7 @@ impl Backend {
             params![format!("synced:{conv}"), started])?;
         tx.commit()?;
         Ok(
-            json!({"conversation_id":conv,"sync_mode":"manual","snapshot_started_at":started,
+            json!({"conversation_id":conv,"sync_mode":"manual","snapshot_started_at":started,"last_synced_at":started,
             "processed_messages":processed,"index_state":"ready","archive_semantics":"first_observed"}),
         )
     }
@@ -419,6 +420,70 @@ mod tests {
     fn source_add(c: &rusqlite::Connection, id: i64, time: i64) {
         c.execute("INSERT INTO Msg_b2f5ff47436671b6e533d8dc3614845d VALUES(?1,?2,?2,?1,1,1,'hello',NULL,0)", params![id,time]).unwrap();
     }
+    #[test]
+    fn all_archive_reads_report_conversation_sync_time() {
+        let (_d, mut b, c) = source_fixture();
+        let p = json!({"conversation":"g"});
+        for method in [
+            "get_messages",
+            "search_messages",
+            "get_updates",
+            "list_members",
+        ] {
+            let result = b.request(method, &p).unwrap();
+            assert!(result.get("last_synced_at").unwrap().is_null(), "{method}");
+        }
+        source_add(&c, 1, 1);
+        let sync = b.request("sync", &p).unwrap();
+        let timestamp = sync["last_synced_at"].clone();
+        assert!(timestamp.is_string());
+        for method in [
+            "get_messages",
+            "search_messages",
+            "get_updates",
+            "list_members",
+        ] {
+            let result = b.request(method, &p).unwrap();
+            assert_eq!(result["last_synced_at"], timestamp, "{method}");
+            let empty = b
+                .request(
+                    method,
+                    &json!({"conversation":"g","start":"2099-01-01T00:00:00Z","query":"missing"}),
+                )
+                .unwrap();
+            assert_eq!(empty["last_synced_at"], timestamp, "{method} empty");
+        }
+        for method in ["get_message_context", "authorize_message"] {
+            assert_eq!(
+                b.request(method, &json!({"message_id":"g:1"})).unwrap()["last_synced_at"],
+                timestamp
+            );
+        }
+        b.index.as_ref().unwrap().grant("h", "other").unwrap();
+        let items = b.request("find_conversations", &json!({})).unwrap();
+        for item in items["items"].as_array().unwrap() {
+            if item["conversation_id"] == "g" {
+                assert_eq!(item["last_synced_at"], timestamp);
+            } else {
+                assert!(item["last_synced_at"].is_null());
+            }
+        }
+        source_add(&c, 2, 2);
+        c.execute(
+            "UPDATE Msg_b2f5ff47436671b6e533d8dc3614845d SET sort_seq=NULL WHERE local_id=2",
+            [],
+        )
+        .unwrap();
+        assert!(b.request("sync", &p).is_err());
+        assert_eq!(
+            b.request("get_messages", &p).unwrap()["last_synced_at"],
+            timestamp
+        );
+        b.index.as_ref().unwrap().revoke("g", true).unwrap();
+        b.index.as_ref().unwrap().grant("g", "群").unwrap();
+        assert!(b.request("get_messages", &p).unwrap()["last_synced_at"].is_null());
+    }
+
     #[test]
     fn manual_sync_delta_restart_and_late_timestamps() {
         let (d, mut b, c) = source_fixture();
