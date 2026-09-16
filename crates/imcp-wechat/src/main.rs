@@ -7,8 +7,6 @@ use serde_json::{json, Value};
 use std::{
     io::{Read, Write},
     path::PathBuf,
-    sync::mpsc,
-    time::Duration,
 };
 #[cfg(test)]
 use wx_db::incremental::MessagePosition;
@@ -46,7 +44,6 @@ struct Backend {
     error: Option<String>,
     root: PathBuf,
     archive_path: PathBuf,
-    has_import_work: bool,
     image_key: Option<[u8; 16]>,
     image_config_unavailable: bool,
     session_diagnostics: Vec<String>,
@@ -59,7 +56,6 @@ impl Backend {
             error: None,
             root: PathBuf::new(),
             archive_path: PathBuf::new(),
-            has_import_work: false,
             image_key: None,
             image_config_unavailable: false,
             session_diagnostics: Vec::new(),
@@ -121,10 +117,10 @@ impl Backend {
                 )?;
                 tx.commit()?;
             }
-            // Retry incomplete imports after the TEXT/BLOB compatibility fix.
-            db.execute("UPDATE conversations SET state='indexing' WHERE state LIKE 'history_column_type_error%'",[])?;
-            // One startup recovery probe; no archive queries while idle thereafter.
-            self.has_import_work = true;
+            db.execute(
+                "UPDATE conversations SET state='sync_required' WHERE state!='ready'",
+                [],
+            )?;
             self.root = if root.join("db_storage").is_dir() {
                 root.join("db_storage")
             } else {
@@ -135,15 +131,11 @@ impl Backend {
                     self.session_diagnostics = db
                         .session_index_diagnostics()
                         .unwrap_or_else(|_| vec!["schema_diagnostic_failed".into()]);
-                    self.error=Some(match db.session_changes_page(0,"",1) {
-                        Ok(_)=>"live_sync_unverified: session timestamp and shard routing are not a durable change log".to_owned(),
-                        Err(_)=>"incompatible_session_range_index".to_owned()
-                    });
+                    self.error = None;
                     self.source = Some(db);
                 }
                 Err(_) => {
                     self.source = None;
-                    self.has_import_work = false;
                     self.error = Some("source_unavailable_or_invalid_key".into());
                 }
             }
@@ -164,7 +156,7 @@ impl Backend {
                     |r| r.get(0),
                 )?;
                 Ok(
-                    json!({"source_available":self.source.is_some(),"session_index_diagnostics":self.session_diagnostics,"image_key_configured":self.image_key.is_some(),"image_config_unavailable":self.image_config_unavailable,"live_sync_ready":false,"compatibility":self.error,"index_bytes":bytes,"quota_bytes":quota,"quota_warning":bytes>quota as u64,"conversations":idx.list("",false)?["items"],"archive_semantics":"first_observed"}),
+                    json!({"source_available":self.source.is_some(),"session_index_diagnostics":self.session_diagnostics,"image_key_configured":self.image_key.is_some(),"image_config_unavailable":self.image_config_unavailable,"live_sync_ready":false,"sync_mode":"manual","manual_sync_ready":self.source.is_some(),"compatibility":self.error,"index_bytes":bytes,"quota_bytes":quota,"quota_warning":bytes>quota as u64,"conversations":idx.list("",false)?["items"],"archive_semantics":"first_observed"}),
                 )
             }
             "find_conversations" => idx.list(&text(p, "query"), false),
@@ -184,7 +176,6 @@ impl Backend {
                     bail!("conversation_required");
                 }
                 idx.grant(&id, &text(p, "name"))?;
-                self.has_import_work = true;
                 for shard in source.source_shards() {
                     idx.db.execute(
                         "INSERT OR IGNORE INTO import_positions VALUES(?1,?2,?3,0)",
@@ -207,7 +198,7 @@ impl Backend {
                         }
                     }
                 }
-                Ok(json!({"approved":true,"conversation_id":id,"state":"indexing"}))
+                Ok(json!({"approved":true,"conversation_id":id,"state":"sync_required"}))
             }
             "local_revoke" => {
                 idx.revoke(
@@ -228,7 +219,27 @@ impl Backend {
                 Ok(json!({"ok":true}))
             }
             "get_messages" | "search_messages" => idx.query(p, false),
-            "get_updates" => idx.query(p, true),
+            "sync" => self.manual_sync(p),
+            "get_updates" => {
+                if p["wait_seconds"].as_i64().unwrap_or(0) != 0 {
+                    bail!("manual_sync_required: wait_seconds is no longer supported; call wechat_sync first");
+                }
+                let mut value = idx.query(p, true)?;
+                let conv = idx.resolve(&text(p, "conversation"))?;
+                let synced: Option<String> = idx
+                    .db
+                    .query_row(
+                        "SELECT value FROM settings WHERE key=?1",
+                        [format!("synced:{conv}")],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                value["sync_mode"] = json!("manual");
+                value["last_synced_at"] = json!(synced);
+                value["source_checked"] = json!(false);
+                value["sync_required"] = json!(true);
+                Ok(value)
+            }
             "list_members" => idx.members(p),
             "get_message_context" => {
                 let id = text(p, "message_id");
@@ -266,99 +277,76 @@ impl Backend {
             _ => bail!("unknown_method"),
         }
     }
-    fn import_batch(&mut self) -> Result<()> {
-        if !self.has_import_work {
-            return Ok(());
+    fn manual_sync(&mut self, p: &Value) -> Result<Value> {
+        let idx = self.index.as_ref().context("setup_required")?;
+        let source = self.source.as_ref().context("source_unavailable")?;
+        let conv = idx.resolve(&text(p, "conversation"))?;
+        let started = chrono::Utc::now().to_rfc3339();
+        let snapshots = source.history_snapshots()?;
+        if snapshots.is_empty() {
+            bail!("source_shards_unavailable");
         }
-        let (Some(idx), Some(source)) = (&self.index, &self.source) else {
-            return Ok(());
-        };
-        let pending:Option<(String,String,String)>=idx.db.query_row("SELECT p.conversation,p.shard,p.position FROM import_positions p JOIN conversations c ON c.id=p.conversation WHERE p.done=0 AND c.enabled=1 AND c.state='indexing' LIMIT 1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
-        let Some((conv, shard, pos)) = pending else {
-            self.has_import_work = false;
-            return Ok(());
-        };
-        let result = source.history_page(&shard, &conv, pos.parse()?, 128);
-        let (batch, last) = match result {
-            Ok(b) => b,
-            Err(e) => {
-                // Error categories only: never include database content or keys.
-                let category = match e {
-                    wx_db::DbError::Sqlite(rusqlite::Error::InvalidColumnType(column, _, kind)) => {
-                        let state = format!("history_column_type_error:{column}:{kind:?}");
-                        idx.db.execute(
-                            "UPDATE conversations SET state=?2 WHERE id=?1",
-                            params![conv, state],
-                        )?;
-                        return Ok(());
-                    }
-                    wx_db::DbError::Sqlite(_) => "history_sql_error",
-                    wx_db::DbError::FtsInit(_) => "history_range_index_missing",
-                    wx_db::DbError::Zstd(_) => "history_decode_error",
-                    wx_db::DbError::EncryptionKey(_) => "history_key_error",
-                    _ => "history_read_failed",
-                };
-                idx.db.execute(
-                    "UPDATE conversations SET state=?2 WHERE id=?1",
-                    params![conv, category],
-                )?;
-                return Ok(());
-            }
-        };
+        // One archive transaction: errors never advance a cursor or publish partial results.
         let tx = idx.db.unchecked_transaction()?;
-        for m in &batch {
-            idx.insert(m)?;
+        let mut processed = 0usize;
+        for snapshot in snapshots {
+            let shard = snapshot.shard_id();
+            let position: Option<String> = tx
+                .query_row(
+                    "SELECT position FROM import_positions WHERE conversation=?1 AND shard=?2",
+                    params![conv, shard],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let mut position = position
+                .map(|s| s.parse::<i64>())
+                .transpose()?
+                .unwrap_or(i64::MIN);
+            loop {
+                let (batch, last) = snapshot.page(&conv, position, 128)?;
+                for message in &batch {
+                    idx.insert(message)?;
+                }
+                processed += batch.len();
+                position = last;
+                if batch.len() < 128 {
+                    break;
+                }
+            }
+            tx.execute("INSERT INTO import_positions VALUES(?1,?2,?3,1) ON CONFLICT(conversation,shard) DO UPDATE SET position=excluded.position,done=1",
+                params![conv, shard, position.to_string()])?;
         }
         tx.execute(
-            "UPDATE import_positions SET position=?3,done=?4 WHERE conversation=?1 AND shard=?2",
-            params![conv, shard, last.to_string(), batch.len() < 128],
+            "UPDATE conversations SET state='ready' WHERE id=?1",
+            [&conv],
         )?;
-        tx.execute("UPDATE conversations SET state='ready' WHERE id=?1 AND NOT EXISTS(SELECT 1 FROM import_positions WHERE conversation=?1 AND done=0)",[conv])?;
+        tx.execute("INSERT INTO settings VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![format!("synced:{conv}"), started])?;
         tx.commit()?;
-        Ok(())
+        Ok(
+            json!({"conversation_id":conv,"sync_mode":"manual","snapshot_started_at":started,
+            "processed_messages":processed,"index_state":"ready","archive_semantics":"first_observed"}),
+        )
     }
 }
+
 fn run() -> Result<()> {
     #[cfg(unix)]
     unsafe {
         libc_umask();
     }
-    let (tx, rx) = mpsc::sync_channel(16);
-    std::thread::spawn(move || {
-        let mut input = std::io::stdin().lock();
-        while let Ok(Some(v)) = read_frame(&mut input) {
-            if tx.send(v).is_err() {
-                break;
-            }
-        }
-    });
     let mut backend = Backend::new();
+    let mut input = std::io::stdin().lock();
     let mut output = std::io::stdout().lock();
-    loop {
-        // Block on IPC while idle. Only initial-import work needs timer ticks.
-        let event = if backend.has_import_work {
-            rx.recv_timeout(Duration::from_millis(100))
-        } else {
-            rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected)
-        };
-        match event {
-            Ok(v) => {
-                let id = v["id"].clone();
-                let response = match backend.request(&text(&v, "method"), &v["params"]) {
-                    Ok(result) => json!({"jsonrpc":"2.0","id":id,"result":result}),
-                    Err(e) => {
-                        json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":e.to_string()}})
-                    }
-                };
-                write_frame(&mut output, &response)?;
+    while let Some(v) = read_frame(&mut input)? {
+        let id = v["id"].clone();
+        let response = match backend.request(&text(&v, "method"), &v["params"]) {
+            Ok(result) => json!({"jsonrpc":"2.0","id":id,"result":result}),
+            Err(e) => {
+                json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":e.to_string()}})
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-        }
-        if backend.import_batch().is_err() {
-            backend.has_import_work = false;
-            backend.error = Some("index_write_failed".into());
-        }
+        };
+        write_frame(&mut output, &response)?;
     }
     Ok(())
 }
@@ -409,6 +397,143 @@ mod tests {
         })
         .unwrap();
     }
+    fn source_fixture() -> (tempfile::TempDir, Backend, rusqlite::Connection) {
+        let d = tempfile::tempdir().unwrap();
+        for directory in ["contact", "session", "message"] {
+            std::fs::create_dir(d.path().join(directory)).unwrap();
+        }
+        rusqlite::Connection::open(d.path().join("contact/contact.db")).unwrap();
+        rusqlite::Connection::open(d.path().join("session/session.db")).unwrap();
+        let c = rusqlite::Connection::open(d.path().join("message/message_0.db")).unwrap();
+        // md5("g") is the source conversation table suffix.
+        c.execute_batch("PRAGMA journal_mode=WAL;
+            CREATE TABLE Name2Id(user_name TEXT); INSERT INTO Name2Id VALUES('a');
+            CREATE TABLE Msg_b2f5ff47436671b6e533d8dc3614845d(local_id INTEGER PRIMARY KEY,sort_seq INTEGER,create_time INTEGER,server_id INTEGER,local_type INTEGER,real_sender_id INTEGER,message_content BLOB,packed_info_data BLOB,status INTEGER);").unwrap();
+        let i = Index::open(&d.path().join("archive.db"), "a").unwrap();
+        i.grant("g", "群").unwrap();
+        let mut backend = Backend::new();
+        backend.source = Some(WechatDb::open(d.path()).unwrap());
+        backend.index = Some(i);
+        (d, backend, c)
+    }
+    fn source_add(c: &rusqlite::Connection, id: i64, time: i64) {
+        c.execute("INSERT INTO Msg_b2f5ff47436671b6e533d8dc3614845d VALUES(?1,?2,?2,?1,1,1,'hello',NULL,0)", params![id,time]).unwrap();
+    }
+    #[test]
+    fn manual_sync_delta_restart_and_late_timestamps() {
+        let (d, mut b, c) = source_fixture();
+        for id in 1..=260 {
+            source_add(&c, id, 1700000000 + id);
+        }
+        let p = json!({"conversation":"g"});
+        assert_eq!(b.request("sync", &p).unwrap()["processed_messages"], 260);
+        let updates = b
+            .request("get_updates", &json!({"conversation":"g","limit":500}))
+            .unwrap();
+        assert_eq!(updates["items"].as_array().unwrap().len(), 260);
+        assert_eq!(updates["source_checked"], false);
+        assert_eq!(b.request("sync", &p).unwrap()["processed_messages"], 0);
+        source_add(&c, 261, 1); // A newly appended row can have an old timestamp.
+        let cursor = json!({"conversation":"g","limit":500,"cursor":updates["next_cursor"]});
+        assert!(b.request("get_updates", &cursor).unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        b.index = None;
+        b.index = Some(Index::open(&d.path().join("archive.db"), "a").unwrap());
+        assert_eq!(b.request("sync", &p).unwrap()["processed_messages"], 1);
+        assert_eq!(
+            b.request("get_updates", &cursor).unwrap()["items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(b
+            .request("get_updates", &json!({"conversation":"g","wait_seconds":1}))
+            .is_err());
+        b.index.as_ref().unwrap().revoke("g", false).unwrap();
+        assert!(b.request("sync", &p).is_err());
+    }
+    #[test]
+    fn sync_error_rolls_back_messages_and_positions() {
+        let (_d, mut b, c) = source_fixture();
+        source_add(&c, 1, 1);
+        b.request("sync", &json!({"conversation":"g"})).unwrap();
+        for id in 2..=130 {
+            source_add(&c, id, id);
+        }
+        c.execute(
+            "UPDATE Msg_b2f5ff47436671b6e533d8dc3614845d SET sort_seq=NULL WHERE local_id=130",
+            [],
+        )
+        .unwrap();
+        assert!(b.request("sync", &json!({"conversation":"g"})).is_err());
+        let idx = b.index.as_ref().unwrap();
+        let count: i64 = idx
+            .db
+            .query_row("SELECT count(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        let position: String = idx
+            .db
+            .query_row("SELECT position FROM import_positions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(position, "1");
+        c.execute(
+            "UPDATE Msg_b2f5ff47436671b6e533d8dc3614845d SET sort_seq=130 WHERE local_id=130",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            b.request("sync", &json!({"conversation":"g"})).unwrap()["processed_messages"],
+            129
+        );
+    }
+    #[test]
+    fn snapshot_defers_concurrent_writes_and_discovers_new_shards() {
+        let (d, mut b, c) = source_fixture();
+        source_add(&c, 1, 1);
+        let source = b.source.as_ref().unwrap();
+        let snapshots = source.history_snapshots().unwrap();
+        source_add(&c, 2, 2);
+        let (batch, position) = snapshots[0].page("g", i64::MIN, 128).unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(position, 1);
+        assert!(snapshots[0].page("g", position, 128).unwrap().0.is_empty());
+        drop(snapshots);
+        assert_eq!(
+            source.history_snapshots().unwrap()[0]
+                .page("g", position, 128)
+                .unwrap()
+                .0
+                .len(),
+            1
+        );
+        let rotated = rusqlite::Connection::open(d.path().join("message/message_1.db")).unwrap();
+        let ddl: String = c
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name='Msg_b2f5ff47436671b6e533d8dc3614845d'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        rotated.execute_batch(&ddl).unwrap();
+        rotated
+            .execute_batch("CREATE TABLE Name2Id(user_name TEXT); INSERT INTO Name2Id VALUES('a');")
+            .unwrap();
+        source_add(&rotated, 3, 0);
+        assert_eq!(source.history_snapshots().unwrap().len(), 2);
+        assert_eq!(
+            b.request("sync", &json!({"conversation":"g"})).unwrap()["processed_messages"],
+            3
+        );
+        assert_eq!(
+            b.request("sync", &json!({"conversation":"g"})).unwrap()["processed_messages"],
+            0
+        );
+    }
+
     #[test]
     fn combined_filters_and_revocation() {
         let (_d, i) = fixture();
@@ -476,18 +601,6 @@ mod tests {
         let mut b = vec![];
         write_frame(&mut b, &json!({"id":1})).unwrap();
         assert_eq!(read_frame(&mut &b[..]).unwrap().unwrap()["id"], 1);
-    }
-    #[test]
-    fn idle_import_does_not_read_archive() {
-        let (_d, i) = fixture();
-        // Removing the scheduler table makes an accidental idle query fail.
-        i.db.execute("DROP TABLE import_positions", []).unwrap();
-        let mut backend = Backend::new();
-        backend.index = Some(i);
-        for _ in 0..10_000 {
-            backend.import_batch().unwrap();
-        }
-        assert!(!backend.has_import_work);
     }
     #[test]
     fn cursor_rejects_other_account_and_revoked_generation() {

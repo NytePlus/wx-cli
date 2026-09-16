@@ -57,6 +57,7 @@ impl Index {
           CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS conversations(id TEXT PRIMARY KEY,name TEXT NOT NULL,enabled INTEGER NOT NULL,state TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS messages(seq INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT UNIQUE NOT NULL,conversation TEXT NOT NULL,member TEXT NOT NULL,time INTEGER NOT NULL,sort_seq INTEGER NOT NULL,type TEXT NOT NULL,body TEXT NOT NULL,fts_body TEXT NOT NULL,data TEXT NOT NULL);
+          CREATE INDEX IF NOT EXISTS by_updates ON messages(conversation,seq);
           CREATE INDEX IF NOT EXISTS by_time ON messages(conversation,time,id);
           CREATE INDEX IF NOT EXISTS by_member ON messages(conversation,member,time,id);
           CREATE INDEX IF NOT EXISTS by_type ON messages(conversation,type,time,id);
@@ -118,7 +119,7 @@ impl Index {
     }
     pub fn grant(&self, id: &str, name: &str) -> Result<()> {
         let tx = self.db.unchecked_transaction()?;
-        tx.execute("INSERT INTO conversations VALUES(?1,?2,1,'indexing') ON CONFLICT(id) DO UPDATE SET enabled=1,name=excluded.name",params![id,name])?;
+        tx.execute("INSERT INTO conversations VALUES(?1,?2,1,'sync_required') ON CONFLICT(id) DO UPDATE SET enabled=1,name=excluded.name",params![id,name])?;
         tx.execute(
             "UPDATE settings SET value=CAST(value AS INTEGER)+1 WHERE key='generation'",
             [],
@@ -130,6 +131,10 @@ impl Index {
         let tx = self.db.unchecked_transaction()?;
         tx.execute("UPDATE conversations SET enabled=0 WHERE id=?1", [id])?;
         if delete {
+            tx.execute(
+                "DELETE FROM settings WHERE key=?1",
+                [format!("synced:{id}")],
+            )?;
             for table in ["messages", "members", "import_positions"] {
                 tx.execute(&format!("DELETE FROM {table} WHERE conversation=?1"), [id])?;
             }

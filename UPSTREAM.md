@@ -17,3 +17,9 @@ not verified minimum/maximum message timestamps. Session sort_timestamp is not
 a durable change log. These must not be used as proof of lossless incremental
 capture. Live readiness is deliberately gated until source invariants can be
 verified. Historical import and archive querying are independent of that gate.
+
+Manual sync (`imcp-wechat` method `sync`) replaces the disabled live path in iMCP.
+It pins read snapshots, imports only rowids after each saved shard position and
+commits archive/positions together. It preserves first-observed append semantics;
+it does not claim to capture in-place mutations or reused rowids. Per-sync shard
+discovery is metadata work; message decoding visits only newly appended rows.

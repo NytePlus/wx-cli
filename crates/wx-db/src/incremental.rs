@@ -2,7 +2,7 @@
 //! Session watermarks are hints, not a durable change log.
 use crate::decode::{check_column_exists, decode_message_for_test, msg_table_name};
 use crate::{DbError, Message, WechatDb};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -18,6 +18,32 @@ pub struct SourceMessage {
     pub position: MessagePosition,
     pub shard_id: String,
     pub message: Message,
+}
+
+/// A read transaction pinned at manual-sync start. Dropping it releases the WAL snapshot.
+pub struct HistorySnapshot {
+    conn: Connection,
+    shard: String,
+}
+impl HistorySnapshot {
+    pub fn shard_id(&self) -> &str {
+        &self.shard
+    }
+    pub fn page(
+        &self,
+        talker: &str,
+        after: i64,
+        limit: usize,
+    ) -> Result<(Vec<SourceMessage>, i64), DbError> {
+        read_source_connection(
+            &self.conn,
+            &self.shard,
+            talker,
+            &MessagePosition::default(),
+            limit,
+            Some(after),
+        )
+    }
 }
 
 /// Verify an actual range SEARCH, not merely a covering-index full SCAN.
@@ -93,6 +119,38 @@ impl WechatDb {
             .collect()
     }
 
+    /// Explicit discovery reads filenames only, including newly rotated shards.
+    /// Pin all shard snapshots before reading any message pages.
+    pub fn history_snapshots(&self) -> Result<Vec<HistorySnapshot>, DbError> {
+        let directory = self
+            .session_path
+            .parent()
+            .and_then(|p| p.parent())
+            .ok_or(DbError::NoShards)?
+            .join("message");
+        let paths = std::fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
+        let mut snapshots = Vec::new();
+        for entry in paths {
+            let shard = entry.file_name().to_string_lossy().into_owned();
+            let Some(number) = shard
+                .strip_prefix("message_")
+                .and_then(|s| s.strip_suffix(".db"))
+            else {
+                continue;
+            };
+            if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
+                continue;
+            }
+            let conn = self.open_related_readonly(&entry.path())?;
+            conn.execute_batch("BEGIN")?;
+            // BEGIN is deferred: force a read to establish the snapshot now.
+            conn.query_row("SELECT rootpage FROM sqlite_master LIMIT 1", [], |_| Ok(()))
+                .optional()?;
+            snapshots.push(HistorySnapshot { conn, shard });
+        }
+        Ok(snapshots)
+    }
+
     /// Fetch a bounded page from one explicitly selected shard. Stable local ID
     /// prevents collisions for unsent messages whose server_id is zero.
     pub fn source_page(
@@ -147,97 +205,106 @@ impl WechatDb {
             .join("message")
             .join(shard_id);
         let conn = self.open_related_readonly(&path)?;
-        let table = msg_table_name(talker);
-        let exists: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
-            [&table],
-            |r| r.get(0),
-        )?;
-        if !exists {
-            return Ok((vec![], history.unwrap_or(0)));
-        }
-        let ct = if check_column_exists(&conn, &table, "WCDB_CT_message_content")? {
-            "m.WCDB_CT_message_content"
-        } else {
-            "NULL"
-        };
-        let compressed = if check_column_exists(&conn, &table, "compress_content")? {
-            "m.compress_content"
-        } else {
-            "NULL"
-        };
-        let predicate = if history.is_some() {
-            "m.rowid>?1 ORDER BY m.rowid LIMIT ?2"
-        } else {
-            "(m.sort_seq,m.create_time,m.server_id,m.local_id)>(?1,?2,?3,?4) ORDER BY m.sort_seq,m.create_time,m.server_id,m.local_id LIMIT ?5"
-        };
-        let sql = format!("SELECT m.sort_seq,m.create_time,m.server_id,m.local_id,m.local_type,COALESCE(n.user_name,''),m.message_content,m.packed_info_data,m.status,{ct},{compressed},m.rowid FROM [{table}] m LEFT JOIN Name2Id n ON m.real_sender_id=n.rowid WHERE {predicate}");
-        let cap = limit.clamp(1, 512) as i64;
-        let rowid = history.unwrap_or(0);
-        let values: Vec<&dyn rusqlite::ToSql> = if history.is_some() {
-            vec![&rowid, &cap]
-        } else {
-            vec![
-                &after.sort_seq,
-                &after.create_time,
-                &after.server_id,
-                &after.local_id,
-                &cap,
-            ]
-        };
-        require_range_search(&conn, &sql, &values)?;
-        let mut stmt = conn.prepare(&sql)?;
-        let mut rows = stmt.query(values.as_slice())?;
-        let mut out = Vec::new();
-        let mut last_rowid = rowid;
-        while let Some(r) = rows.next()? {
-            last_rowid = r.get(11)?;
-            let position = MessagePosition {
-                sort_seq: r.get(0)?,
-                create_time: r.get(1)?,
-                server_id: r.get(2)?,
-                local_id: r.get(3)?,
-            };
-            let content = match r.get_ref(6)? {
-                rusqlite::types::ValueRef::Blob(b) | rusqlite::types::ValueRef::Text(b) => {
-                    b.to_vec()
-                }
-                _ => Vec::new(),
-            };
-            let optional_bytes = |column| -> Result<Option<Vec<u8>>, rusqlite::Error> {
-                Ok(match r.get_ref(column)? {
-                    rusqlite::types::ValueRef::Blob(b) | rusqlite::types::ValueRef::Text(b)
-                        if !b.is_empty() =>
-                    {
-                        Some(b.to_vec())
-                    }
-                    _ => None,
-                })
-            };
-            let packed = optional_bytes(7)?;
-            let compressed = optional_bytes(10)?;
-            let message = decode_message_for_test(
-                position.sort_seq,
-                position.server_id,
-                r.get(4)?,
-                &r.get::<_, String>(5)?,
-                talker,
-                position.create_time,
-                &content,
-                packed.as_deref(),
-                r.get::<_, Option<i32>>(8)?.unwrap_or(0),
-                r.get(9)?,
-                compressed.as_deref(),
-                talker.ends_with("@chatroom"),
-            )?;
-            out.push(SourceMessage {
-                position,
-                shard_id: shard_id.to_owned(),
-                message,
-            });
-        }
-        Ok((out, last_rowid))
+        read_source_connection(&conn, shard_id, talker, after, limit, history)
     }
+}
+
+fn read_source_connection(
+    conn: &Connection,
+    shard_id: &str,
+    talker: &str,
+    after: &MessagePosition,
+    limit: usize,
+    history: Option<i64>,
+) -> Result<(Vec<SourceMessage>, i64), DbError> {
+    let table = msg_table_name(talker);
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+        [&table],
+        |r| r.get(0),
+    )?;
+    if !exists {
+        return Ok((vec![], history.unwrap_or(0)));
+    }
+    let ct = if check_column_exists(&conn, &table, "WCDB_CT_message_content")? {
+        "m.WCDB_CT_message_content"
+    } else {
+        "NULL"
+    };
+    let compressed = if check_column_exists(&conn, &table, "compress_content")? {
+        "m.compress_content"
+    } else {
+        "NULL"
+    };
+    let predicate = if history.is_some() {
+        "m.rowid>?1 ORDER BY m.rowid LIMIT ?2"
+    } else {
+        "(m.sort_seq,m.create_time,m.server_id,m.local_id)>(?1,?2,?3,?4) ORDER BY m.sort_seq,m.create_time,m.server_id,m.local_id LIMIT ?5"
+    };
+    let sql = format!("SELECT m.sort_seq,m.create_time,m.server_id,m.local_id,m.local_type,COALESCE(n.user_name,''),m.message_content,m.packed_info_data,m.status,{ct},{compressed},m.rowid FROM [{table}] m LEFT JOIN Name2Id n ON m.real_sender_id=n.rowid WHERE {predicate}");
+    let cap = limit.clamp(1, 512) as i64;
+    let rowid = history.unwrap_or(0);
+    let values: Vec<&dyn rusqlite::ToSql> = if history.is_some() {
+        vec![&rowid, &cap]
+    } else {
+        vec![
+            &after.sort_seq,
+            &after.create_time,
+            &after.server_id,
+            &after.local_id,
+            &cap,
+        ]
+    };
+    require_range_search(&conn, &sql, &values)?;
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query(values.as_slice())?;
+    let mut out = Vec::new();
+    let mut last_rowid = rowid;
+    while let Some(r) = rows.next()? {
+        last_rowid = r.get(11)?;
+        let position = MessagePosition {
+            sort_seq: r.get(0)?,
+            create_time: r.get(1)?,
+            server_id: r.get(2)?,
+            local_id: r.get(3)?,
+        };
+        let content = match r.get_ref(6)? {
+            rusqlite::types::ValueRef::Blob(b) | rusqlite::types::ValueRef::Text(b) => b.to_vec(),
+            _ => Vec::new(),
+        };
+        let optional_bytes = |column| -> Result<Option<Vec<u8>>, rusqlite::Error> {
+            Ok(match r.get_ref(column)? {
+                rusqlite::types::ValueRef::Blob(b) | rusqlite::types::ValueRef::Text(b)
+                    if !b.is_empty() =>
+                {
+                    Some(b.to_vec())
+                }
+                _ => None,
+            })
+        };
+        let packed = optional_bytes(7)?;
+        let compressed = optional_bytes(10)?;
+        let message = decode_message_for_test(
+            position.sort_seq,
+            position.server_id,
+            r.get(4)?,
+            &r.get::<_, String>(5)?,
+            talker,
+            position.create_time,
+            &content,
+            packed.as_deref(),
+            r.get::<_, Option<i32>>(8)?.unwrap_or(0),
+            r.get(9)?,
+            compressed.as_deref(),
+            talker.ends_with("@chatroom"),
+        )?;
+        out.push(SourceMessage {
+            position,
+            shard_id: shard_id.to_owned(),
+            message,
+        });
+    }
+    Ok((out, last_rowid))
 }
 
 #[cfg(test)]
