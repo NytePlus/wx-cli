@@ -68,7 +68,6 @@ pub async fn capture_key(
     let script_path = script_dir.path().join("capture.py");
     std::fs::write(&script_path, CAPTURE_KEY_SCRIPT)?;
 
-
     // Launch LLDB in wait mode.
     let mut lldb = AsyncCommand::new("lldb")
         .args([
@@ -115,7 +114,6 @@ pub async fn capture_key(
                 Ok(None) => break Err(KeychainError::NoPbkdfCalls),
                 Err(e) => break Err(KeychainError::Other(format!("read error: {e}"))),
             };
-
 
             if let Some(caps) = re_header.captures(&line) {
                 let count: u32 = caps[1].parse().unwrap_or(0);
