@@ -57,6 +57,7 @@ impl Index {
           CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS conversations(id TEXT PRIMARY KEY,name TEXT NOT NULL,enabled INTEGER NOT NULL,state TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS messages(seq INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT UNIQUE NOT NULL,conversation TEXT NOT NULL,member TEXT NOT NULL,time INTEGER NOT NULL,sort_seq INTEGER NOT NULL,type TEXT NOT NULL,body TEXT NOT NULL,fts_body TEXT NOT NULL,data TEXT NOT NULL);
+          CREATE INDEX IF NOT EXISTS by_updates ON messages(conversation,seq);
           CREATE INDEX IF NOT EXISTS by_time ON messages(conversation,time,id);
           CREATE INDEX IF NOT EXISTS by_member ON messages(conversation,member,time,id);
           CREATE INDEX IF NOT EXISTS by_type ON messages(conversation,type,time,id);
@@ -118,7 +119,7 @@ impl Index {
     }
     pub fn grant(&self, id: &str, name: &str) -> Result<()> {
         let tx = self.db.unchecked_transaction()?;
-        tx.execute("INSERT INTO conversations VALUES(?1,?2,1,'indexing') ON CONFLICT(id) DO UPDATE SET enabled=1,name=excluded.name",params![id,name])?;
+        tx.execute("INSERT INTO conversations VALUES(?1,?2,1,'sync_required') ON CONFLICT(id) DO UPDATE SET enabled=1,name=excluded.name",params![id,name])?;
         tx.execute(
             "UPDATE settings SET value=CAST(value AS INTEGER)+1 WHERE key='generation'",
             [],
@@ -130,6 +131,10 @@ impl Index {
         let tx = self.db.unchecked_transaction()?;
         tx.execute("UPDATE conversations SET enabled=0 WHERE id=?1", [id])?;
         if delete {
+            tx.execute(
+                "DELETE FROM settings WHERE key=?1",
+                [format!("synced:{id}")],
+            )?;
             for table in ["messages", "members", "import_positions"] {
                 tx.execute(&format!("DELETE FROM {table} WHERE conversation=?1"), [id])?;
             }
@@ -153,9 +158,27 @@ impl Index {
             _ => bail!("ambiguous_conversation: {}", serde_json::to_string(&ids)?),
         }
     }
+    /// Freshness is scoped to a conversation, including empty/not-yet-synced results.
+    pub fn with_sync_metadata(&self, conversation: &str, mut value: Value) -> Result<Value> {
+        let synced: Option<String> = self
+            .db
+            .query_row(
+                "SELECT value FROM settings WHERE key=?1",
+                [format!("synced:{conversation}")],
+                |r| r.get(0),
+            )
+            .optional()?;
+        value["last_synced_at"] = json!(synced);
+        value["sync_mode"] = json!("manual");
+        Ok(value)
+    }
     pub fn list(&self, q: &str, local: bool) -> Result<Value> {
         let mut stmt=self.db.prepare("SELECT id,name,state,enabled FROM conversations WHERE (enabled=1 OR ?2) AND (instr(name,?1)>0 OR instr(id,?1)>0) ORDER BY name,id LIMIT 200")?;
         let items=stmt.query_map(params![q,local],|r|Ok(json!({"conversation_id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"index_state":r.get::<_,String>(2)?,"enabled":r.get::<_,bool>(3)?})))?.collect::<Result<Vec<_>,_>>()?;
+        let items = items
+            .into_iter()
+            .map(|item| self.with_sync_metadata(&text(&item, "conversation_id"), item))
+            .collect::<Result<Vec<_>>>()?;
         Ok(json!({"items":items}))
     }
     pub fn insert(&self, source: &SourceMessage) -> Result<bool> {
