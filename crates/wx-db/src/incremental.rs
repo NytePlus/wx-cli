@@ -226,12 +226,12 @@ fn read_source_connection(
     if !exists {
         return Ok((vec![], history.unwrap_or(0)));
     }
-    let ct = if check_column_exists(&conn, &table, "WCDB_CT_message_content")? {
+    let ct = if check_column_exists(conn, &table, "WCDB_CT_message_content")? {
         "m.WCDB_CT_message_content"
     } else {
         "NULL"
     };
-    let compressed = if check_column_exists(&conn, &table, "compress_content")? {
+    let compressed = if check_column_exists(conn, &table, "compress_content")? {
         "m.compress_content"
     } else {
         "NULL"
@@ -255,7 +255,7 @@ fn read_source_connection(
             &cap,
         ]
     };
-    require_range_search(&conn, &sql, &values)?;
+    require_range_search(conn, &sql, &values)?;
     let mut stmt = conn.prepare(&sql)?;
     let mut rows = stmt.query(values.as_slice())?;
     let mut out = Vec::new();
